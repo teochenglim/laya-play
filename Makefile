@@ -16,7 +16,7 @@ BUILDX_PUSH_FLAGS := --provenance=false --sbom=false
 
 .PHONY: help build build-all push push-all push-aliases \
         ghcr-build ghcr-build-all ghcr-push ghcr-push-all ghcr-push-aliases \
-        run test stop clean
+        run test examples stop clean
 
 help:
 	@echo "Local dev:"
@@ -35,7 +35,8 @@ help:
 	@echo ""
 	@echo "Run + test:"
 	@echo "  make run  MODEL=... BACKEND=cpu|gpu   run image locally on :$(PORT)"
-	@echo "  make test                             curl /health and /v1/systemone"
+	@echo "  make test                             curl /health and /v1/systemone (one quick check)"
+	@echo "  make examples [N=1..5]                run examples/curl-examples.sh (all, or just #N)"
 	@echo "  make stop                             stop and remove the local test container"
 	@echo "  make clean                            remove local Docker Hub + GHCR images for this project"
 
@@ -104,6 +105,9 @@ test:
 				"escalate": {"type": "noul", "instructions": "Escalate to a human immediately?"} \
 			} \
 		}' | python3 -m json.tool
+
+examples:
+	HOST=http://localhost:$(PORT) bash examples/curl-examples.sh $(N)
 
 stop:
 	docker rm -f $(CONTAINER) >/dev/null 2>&1 || true

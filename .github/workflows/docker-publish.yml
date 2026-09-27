@@ -22,6 +22,16 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+    # Only rebuild (12 heavy jobs, each downloading multi-GB checkpoints) when
+    # something that actually changes the image changed -- not for README,
+    # Makefile, or examples/ commits. This filter is applied to tag pushes too
+    # (branches/tags + paths combine with AND), so a version tag on a
+    # docs-only commit needs workflow_dispatch instead.
+    paths:
+      - "pyproject.toml"
+      - "uv.lock"
+      - "Dockerfile"
+      - ".github/workflows/docker-publish.yml"
   workflow_dispatch:
 
 env:
@@ -30,7 +40,55 @@ env:
   LATEST_MODEL: english
 
 jobs:
+  # Precise gate on top of the paths: filter above. That filter only avoids
+  # running CI at all for commits that don't touch uv.lock/pyproject.toml/
+  # Dockerfile; this job then checks whether uv.lock's *laya* or *torch*
+  # entries themselves changed version, so bumping some unrelated dependency
+  # (fastapi, pydantic, ...) doesn't burn 19 jobs' worth of multi-GB
+  # downloads for nothing.
+  check-laya:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.diff.outputs.changed }}
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compare laya/torch pinned versions against the previous commit
+        id: diff
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "manual dispatch: forcing a rebuild regardless of pinned versions"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          BEFORE_SHA="${{ github.event.before }}"
+          if [ -z "$BEFORE_SHA" ] || [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            echo "no previous commit to diff against (new branch/tag) -- treating as changed"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git show "$BEFORE_SHA:uv.lock" > /tmp/prev-uv.lock 2>/dev/null || true
+
+          CHANGED=false
+          for PKG in laya torch; do
+            CURRENT="$(python3 .github/scripts/extract_pkg_version.py uv.lock "$PKG")"
+            PREVIOUS="$(python3 .github/scripts/extract_pkg_version.py /tmp/prev-uv.lock "$PKG")"
+            echo "$PKG version: previous='$PREVIOUS' current='$CURRENT'"
+            if [ "$CURRENT" != "$PREVIOUS" ]; then
+              CHANGED=true
+            fi
+          done
+
+          echo "changed=$CHANGED" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: check-laya
+    if: needs.check-laya.outputs.changed == 'true'
     runs-on: ${{ matrix.platform == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     permissions:
       contents: read

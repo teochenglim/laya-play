@@ -8,6 +8,25 @@ urgency, sentiment, etc.) in tens of milliseconds.
 This repo packages Laya's built-in `laya[serve]` HTTP server as Docker
 images — no server code needed, `laya-serve` ships the whole API.
 
+## a. Use the published image (GHCR) — no build required
+
+Images are published to `ghcr.io/teochenglim/laya` by
+[CI](#ci-multi-arch-cpugpu-matrix) on every push to `main`:
+
+```bash
+# CPU, default checkpoint (english) — runs anywhere, no GPU needed
+docker run -p 8080:8080 ghcr.io/teochenglim/laya
+
+# a specific checkpoint / backend
+docker run -p 8080:8080 ghcr.io/teochenglim/laya:multilingual-cpu
+
+# GPU host (needs the NVIDIA Container Toolkit installed on the host)
+docker run --gpus all -p 8080:8080 ghcr.io/teochenglim/laya:gpu
+```
+
+GHCR images are public, so no `docker login` is needed to pull them. Once
+it's running, see [REST API](#rest-api) below to test it.
+
 ## REST API
 
 `POST /v1/systemone` implements the TypeSafe Jev `/v1/systemone` wire
@@ -36,6 +55,17 @@ curl http://localhost:8080/v1/systemone \
 ```
 
 `GET /health` reports which checkpoints are loaded.
+
+More scenarios (sentiment, spam/moderation, HR triage, non-English auto-routing
+vs. a forced checkpoint) are in [`examples/curl-examples.sh`](examples/curl-examples.sh):
+
+```bash
+make examples          # run all 5 against http://localhost:8080
+make examples N=4      # run just example 4
+
+# or call the script directly, e.g. against uv run laya-serve on :8000 instead:
+HOST=http://localhost:8000 ./examples/curl-examples.sh
+```
 
 ## Image tags
 
@@ -68,23 +98,46 @@ wheel (`cu130`) on top of that base, for GPU hosts (e.g. a DigitalOcean GPU
 Droplet). `LAYA_DEVICE` stays `auto` in both, so the same image just uses
 whatever the host actually gives it at runtime.
 
-## a. Use the published image (GHCR) — no build required
+## Makefile reference
 
-Images are published to `ghcr.io/teochenglim/laya` by
-[CI](#ci-multi-arch-cpugpu-matrix) on every push to `main`:
+Every target takes `MODEL=english|multilingual|typed-decisions` and
+`BACKEND=cpu|gpu` (both default to `english`/`cpu`); `make help` prints this
+same list.
 
-```bash
-# CPU, default checkpoint (english) — runs anywhere, no GPU needed
-docker run -p 8080:8080 ghcr.io/teochenglim/laya
+```
+Local dev:
+  make dev            uv run python laya_init.py
+  make serve          uv run laya-serve (reads .env for HF_TOKEN)
 
-# a specific checkpoint / backend
-docker run -p 8080:8080 ghcr.io/teochenglim/laya:multilingual-cpu
+Docker Hub (teochenglim/laya):
+  make build   MODEL=... BACKEND=cpu|gpu   build one (model, backend) variant
+  make build-all                           build all model x backend variants
+  make push    MODEL=... BACKEND=cpu|gpu   build+push one variant, tag <model>-<backend>
+  make push-all                            build+push every variant
+  make push-aliases                        point :latest/:cpu/:gpu at english
 
-# GPU host (needs the NVIDIA Container Toolkit installed on the host)
-docker run --gpus all -p 8080:8080 ghcr.io/teochenglim/laya:gpu
+GHCR (ghcr.io/teochenglim/laya):
+  make ghcr-build / ghcr-build-all / ghcr-push / ghcr-push-all / ghcr-push-aliases
+
+Run + test:
+  make run  MODEL=... BACKEND=cpu|gpu   run image locally on :8080
+  make test                             curl /health and /v1/systemone (one quick check)
+  make examples [N=1..5]                run examples/curl-examples.sh (all, or just #N)
+  make stop                             stop and remove the local test container
+  make clean                            remove local Docker Hub + GHCR images for this project
 ```
 
-GHCR images are public, so no `docker login` is needed to pull them.
+Example end-to-end flow — build the multilingual/GPU variant, run it, and try
+both the quick check and the fuller example set:
+
+```bash
+make build    MODEL=multilingual BACKEND=gpu   # -> teochenglim/laya:multilingual-gpu
+make run      MODEL=multilingual BACKEND=gpu   # docker run -p 8080:8080 ...
+make test                                      # one quick curl /health + /v1/systemone
+make examples                                  # all 5 scenarios from examples/curl-examples.sh
+make examples N=4                              # or just one of them
+make stop
+```
 
 ## b. Build and push (Docker Hub)
 
@@ -142,7 +195,15 @@ by default.
 ## CI: multi-arch CPU/GPU matrix
 
 [`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml)
-runs on every push to `main` (also on version tags / manual dispatch) and:
+runs on push to `main` or a `v*` tag **only when `pyproject.toml`, `uv.lock`,
+`Dockerfile`, or the workflow itself changed** — a README/Makefile/examples
+commit won't trigger the full (12-job, multi-GB-download) matrix. On top of
+that, a `check-laya` job compares `uv.lock`'s pinned `laya` and `torch`
+versions against the previous commit and skips the whole matrix unless one of
+those two actually moved — so bumping some unrelated dependency (fastapi,
+pydantic, ...) doesn't burn 19 jobs' worth of downloads for nothing. Use the
+"Run workflow" button (`workflow_dispatch`) to force a rebuild regardless of
+what changed:
 
 1. **`build`** — a `{model} x {backend} x {platform}` matrix (3 x 2 x 2 = 12
    jobs) builds each arch on its *native* runner (`ubuntu-latest` for amd64,
