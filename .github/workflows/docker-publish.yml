@@ -1,0 +1,146 @@
+name: Build and push to GHCR
+
+# Publishes every (checkpoint x backend) combination as a multi-arch (amd64 +
+# arm64) tag:
+#   ghcr.io/<owner>/laya:english-cpu
+#   ghcr.io/<owner>/laya:english-gpu
+#   ghcr.io/<owner>/laya:multilingual-cpu
+#   ghcr.io/<owner>/laya:multilingual-gpu
+#   ghcr.io/<owner>/laya:typed-decisions-cpu
+#   ghcr.io/<owner>/laya:typed-decisions-gpu
+# plus three convenience aliases pointing at the english checkpoint:
+#   :latest -> english-cpu   (safe default: runs anywhere, no GPU required)
+#   :cpu    -> english-cpu
+#   :gpu    -> english-gpu
+#
+# Each arch builds on its own native runner (no QEMU) since the build itself
+# loads a multi-GB torch checkpoint -- emulating that would be extremely slow
+# and flaky. The two arch-specific images are then merged into one manifest
+# list per tag.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/laya
+  LATEST_MODEL: english
+
+jobs:
+  build:
+    runs-on: ${{ matrix.platform == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        model: [english, multilingual, typed-decisions]
+        backend: [cpu, gpu]
+        platform: [amd64, arm64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # GPU images just need the CUDA-enabled torch wheel baked in; they build fine
+      # without a physical GPU (torch.cuda.is_available() is False here, so the
+      # checkpoint-preload step below falls back to CPU during the build itself)
+      # and only actually use CUDA once run on a real GPU host later.
+      #
+      # Public convaiinnovations/* checkpoints don't need a token; HF_TOKEN just
+      # raises the download rate limit on shared CI runner IPs. Optional secret.
+      #
+      # Tagged per-arch (e.g. :english-cpu-amd64) as a staging artifact for the
+      # merge job below -- not meant to be pulled directly.
+      - name: Build and push ${{ matrix.model }}-${{ matrix.backend }} (${{ matrix.platform }})
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          provenance: false
+          sbom: false
+          platforms: linux/${{ matrix.platform }}
+          build-args: |
+            LAYA_MODEL=${{ matrix.model }}
+            BACKEND=${{ matrix.backend }}
+          secrets: |
+            hf_token=${{ secrets.HF_TOKEN }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.model }}-${{ matrix.backend }}-${{ matrix.platform }}
+          cache-from: type=gha,scope=${{ matrix.model }}-${{ matrix.backend }}-${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.model }}-${{ matrix.backend }}-${{ matrix.platform }}
+
+  merge:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        model: [english, multilingual, typed-decisions]
+        backend: [cpu, gpu]
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Combines the amd64 and arm64 images into one multi-arch manifest under
+      # the clean, public-facing tag (e.g. :english-cpu).
+      - name: Merge amd64 + arm64 into ${{ matrix.model }}-${{ matrix.backend }}
+        run: |
+          docker buildx imagetools create \
+            -t $REGISTRY/$IMAGE_NAME:${{ matrix.model }}-${{ matrix.backend }} \
+            $REGISTRY/$IMAGE_NAME:${{ matrix.model }}-${{ matrix.backend }}-amd64 \
+            $REGISTRY/$IMAGE_NAME:${{ matrix.model }}-${{ matrix.backend }}-arm64
+
+  tag-aliases:
+    needs: merge
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Registry-side retags via imagetools: no pull needed, just copies manifests.
+      - name: Point :latest, :cpu, :gpu at the ${{ env.LATEST_MODEL }} checkpoint
+        run: |
+          docker buildx imagetools create \
+            -t $REGISTRY/$IMAGE_NAME:latest \
+            $REGISTRY/$IMAGE_NAME:$LATEST_MODEL-cpu
+
+          docker buildx imagetools create \
+            -t $REGISTRY/$IMAGE_NAME:cpu \
+            $REGISTRY/$IMAGE_NAME:$LATEST_MODEL-cpu
+
+          docker buildx imagetools create \
+            -t $REGISTRY/$IMAGE_NAME:gpu \
+            $REGISTRY/$IMAGE_NAME:$LATEST_MODEL-gpu
